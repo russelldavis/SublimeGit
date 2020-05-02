@@ -13,10 +13,76 @@ GIT_BLAME_TITLE_PREFIX = '*git-blame*: '
 GIT_BLAME_SYNTAX = 'Packages/SublimeGit/syntax/SublimeGit Blame.tmLanguage'
 
 
+from threading import Thread
+from time import time
+from functools import wraps, partial
+
+def decorator(wrapper):
+    """Simplifies creation of decorators.
+    Removes a layer of nesting (flat is better than nested).
+    Example:
+
+        @decorator
+        def log_call(wrapped, *args, **kwargs):
+            print("entering", wrapped)
+            return wrapped(*args, **kwargs)
+
+        # Instead of:
+
+        def log_call(wrapped):
+            @wraps(wrapped)
+            def wrapper(*args, **kwargs):
+                print("entering", wrapped)
+                return wrapped(*args, **kwargs)
+            return wrapper
+    """
+    @wraps(wrapper)
+    def new_decorator(*new_decorator_args):
+        # new_decorator_args will be [wrapped] for functions,
+        # or [self, wrapped] for methods
+        @wraps(new_decorator_args[-1])
+        def new_wrapper(*args, **kwargs):
+            # In python >= 3.5, this can be simplified w/ a leading splat
+            return wrapper(*(new_decorator_args + (args, kwargs)))
+        return new_wrapper
+    return new_decorator
+
+
+class AsyncByView:
+    PROGRESS_INTERVAL_S = 1
+
+    def __init__(self, title: str):
+        self.title = title
+        self.running_view_ids = set()
+
+    @decorator
+    def __call__(self, wrapped, args, kwargs):
+        view = sublime.active_window().active_view()
+        if view.id() in self.running_view_ids:
+            print("Already running:", self.title)
+            return
+
+        start_time = time()
+        run_thread = Thread(target=partial(wrapped, *args, **kwargs))
+        run_thread.start()
+        Thread(target=self.monitor, args=(run_thread, view, start_time)).start()
+
+    def monitor(self, run_thread, view, start_time):
+        self.running_view_ids.add(view.id())
+
+        while run_thread.is_alive():
+            run_thread.join(self.PROGRESS_INTERVAL_S)
+            elapsed = time() - start_time
+            view.set_status(self.title, "Running {}: {:.0f}s".format(self.title, elapsed))
+
+        view.erase_status(self.title)
+        self.running_view_ids.remove(view.id())
+
+
+
 class GitBlameCache(object):
     commits = {}
     lines = {}
-
 
 class GitBlameCommand(WindowCommand, GitCmd, GitStatusHelper):
     """
@@ -79,28 +145,38 @@ class GitBlameCommand(WindowCommand, GitCmd, GitStatusHelper):
 
         title = GIT_BLAME_TITLE_PREFIX + filename.replace(repo, '').lstrip('/\\')
         if revision:
-            title = '%s @ %s' % (title, revision[:7])
+            short_rev = revision[:7]
+            if revision[-1] == "^":
+                short_rev += "^"
+            title = '%s @ %s' % (title, short_rev)
         view = find_view_by_settings(self.window, git_view='blame', git_repo=repo,
                                      git_blame_file=filename, git_blame_rev=revision)
 
-        if view is None:
-            view = self.window.new_file()
-            view.set_name(title)
-            view.set_scratch(True)
-            view.set_read_only(True)
-            view.set_syntax_file(GIT_BLAME_SYNTAX)
+        if view:
+            # I'm eliminating the "refresh" behavior here. Since blames can be slow,
+            # just show the existing one, and let the user close it and re-blame if
+            # they want a refresh.
+            view.window().focus_view(view)
+            return
 
-            view.settings().set('word_wrap', False)
-            view.settings().set('git_view', 'blame')
-            view.settings().set('git_repo', repo)
-            view.settings().set('git_blame_file', filename)
-            view.settings().set('git_blame_rev', revision)
+        active_view = self.window.active_view()
+        view = self.window.new_file()
+        # new_file() steals focus, bring it back
+        self.window.focus_view(active_view)
+        view.set_name(title)
+        view.set_scratch(True)
+        view.set_read_only(True)
+        view.set_syntax_file(GIT_BLAME_SYNTAX)
 
+        view.settings().set('word_wrap', False)
+        view.settings().set('git_view', 'blame')
+        view.settings().set('git_repo', repo)
+        view.settings().set('git_blame_file', filename)
+        view.settings().set('git_blame_rev', revision)
         view.run_command('git_blame_refresh', {'filename': filename, 'revision': revision, 'rows': rows})
 
 
 class GitBlameRefreshCommand(TextCommand, GitCmd):
-
     HEADER_RE = re.compile(r'^(?P<sha>[0-9a-f]{40}) (\d+) (\d+) ?(\d+)?$')
 
     def parse_commit_line(self, commitline):
@@ -185,6 +261,7 @@ class GitBlameRefreshCommand(TextCommand, GitCmd):
     def is_visible(self):
         return False
 
+    @AsyncByView("Blame")
     def run(self, edit, filename=None, revision=None, rows=None):
         filename = filename or self.view.settings().get('git_blame_file')
         revision = revision or self.view.settings().get('git_blame_rev')
@@ -192,36 +269,47 @@ class GitBlameRefreshCommand(TextCommand, GitCmd):
 
         commits, lines = self.get_blame(repo, filename, revision)
         if not commits or not lines:
+            sublime.error_message("No results")
+            self.view.close()
             return
         GitBlameCache.commits[self.view.id()] = commits
         GitBlameCache.lines[self.view.id()] = lines
 
         blame = self.format_blame(commits, lines)
+        self.view.run_command('git_blame_update_view', {'blame': blame, 'lines': lines, 'rows': rows})
 
-        if blame:
-            # write blame to file
-            self.view.set_read_only(False)
-            if self.view.size() > 0:
-                self.view.erase(edit, sublime.Region(0, self.view.size()))
-            self.view.insert(edit, 0, blame)
-            self.view.set_read_only(True)
 
-            # mark lines selected
-            if rows:
-                lines = []
-                for row in rows:
-                    lines.append(self.view.line(self.view.text_point(row, 0)))
+# Needs to be a separate command because the edit object can only be used synchronously
+class GitBlameUpdateViewCommand(TextCommand):
+    def is_visible(self):
+        return False
 
-                # add dots in the sidebar
-                self.view.add_regions('git-blame.lines', lines, 'git-blame.selection', 'dot', sublime.HIDDEN)
+    def run(self, edit, blame, lines, rows=None):
+        # write blame to file
+        self.view.set_read_only(False)
+        if self.view.size() > 0:
+            self.view.erase(edit, sublime.Region(0, self.view.size()))
+        self.view.insert(edit, 0, blame)
+        self.view.set_read_only(True)
 
-            # place cursor on same line as in old selection
-            row = rows[0] if rows else 0
-            point = self.view.text_point(row, 0)
-            self.view.sel().clear()
-            self.view.sel().add(sublime.Region(point))
-            if not self.view.visible_region().contains(point):
-                sublime.set_timeout(lambda: self.view.show_at_center(point), 50)
+        # mark lines selected
+        if rows:
+            lines = []
+            for row in rows:
+                lines.append(self.view.line(self.view.text_point(row, 0)))
+
+            # add dots in the sidebar
+            self.view.add_regions('git-blame.lines', lines, 'git-blame.selection', 'dot', sublime.HIDDEN)
+
+        # place cursor on same line as in old selection
+        row = rows[0] if rows else 0
+        point = self.view.text_point(row, 0)
+        self.view.sel().clear()
+        self.view.sel().add(sublime.Region(point))
+        if not self.view.visible_region().contains(point):
+            sublime.set_timeout(lambda: self.view.show_at_center(point), 50)
+        self.view.window().focus_view(self.view)
+
 
 
 class GitBlameEventListener(EventListener):
@@ -321,4 +409,4 @@ class GitBlameBlameCommand(TextCommand, GitBlameTextCommand):
         window = self.view.window()
         for sha, c in commits.items():
             filename = c.get('filename', None)
-            window.run_command('git_blame', {'repo': repo, 'filename': filename, 'revision': sha})
+            window.run_command('git_blame', {'repo': repo, 'filename': filename, 'revision': sha + "^"})

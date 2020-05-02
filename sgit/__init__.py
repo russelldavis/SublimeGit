@@ -24,7 +24,7 @@ from .gc import GitGarbageCollectCommand
 from .log import GitLogCommand, GitQuickLogCommand, GitQuickLogCurrentFileCommand
 
 from .blame import (GitBlameCommand, GitBlameRefreshCommand, GitBlameShowCommand,
-                    GitBlameBlameCommand)
+                    GitBlameBlameCommand, GitBlameUpdateViewCommand)
 from .blame import GitBlameEventListener
 
 from .remote import (GitPushCurrentBranchCommand, GitPullCurrentBranchCommand,
