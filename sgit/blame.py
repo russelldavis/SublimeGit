@@ -128,11 +128,16 @@ class GitBlameCommand(WindowCommand, GitCmd, GitStatusHelper):
         if not repo:
             return
 
+        # RD: This check will fail when passing in a valid filename for an old revision
+        # that has since been moved. This could be fixed by passing in --with-tree=<sha>
+        # to git ls-files, but this whole check seems unnecessary anyway. If the file
+        # is invalid, let the blame command fail and deal with the error there.
+        #
         # check if file is known to git
-        in_git = self.file_in_git(repo, filename)
-        if not in_git:
-            sublime.error_message('The file %s is not tracked by git.' % filename)
-            return
+        # in_git = self.file_in_git(repo, filename)
+        # if not in_git:
+        #     sublime.error_message('The file %s is not tracked by git.' % filename)
+        #     return
 
         # figure out where we are in the file
         rows = []
