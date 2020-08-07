@@ -36,17 +36,19 @@ class GitShowCommand(WindowCommand, GitCmd):
 
         title = GIT_SHOW_TITLE_PREFIX + obj[:7] if len(obj) == 40 else obj
         view = find_view_by_settings(self.window, git_view='show', git_repo=repo, git_show_obj=obj)
-        if not view:
-            view = self.window.new_file()
-            view.set_name(title)
-            view.set_scratch(True)
-            view.set_read_only(True)
-            view.set_syntax_file(GIT_SHOW_SYNTAX)
+        if view:
+            view.window().focus_view(view)
+            return
 
-            view.settings().set('git_view', 'show')
-            view.settings().set('git_repo', repo)
-            view.settings().set('git_show_obj', obj)
+        view = self.window.new_file()
+        view.set_name(title)
+        view.set_scratch(True)
+        view.set_read_only(True)
+        view.set_syntax_file(GIT_SHOW_SYNTAX)
 
+        view.settings().set('git_view', 'show')
+        view.settings().set('git_repo', repo)
+        view.settings().set('git_show_obj', obj)
         view.run_command('git_show_refresh', {'obj': obj})
 
 
